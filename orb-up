@@ -2,9 +2,14 @@
 set -euo pipefail
 
 SESSION="${ORB_UP_SESSION:-amp-runner}"
-UPDATE_CRON="${ORB_UP_UPDATE_CRON:-17 4 * * *}"
+UPDATE_CRON="${ORB_UP_UPDATE_CRON:-17 * * * *}"
 CRON_MARKER="# orb-up automatic update"
-STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/orb-up"
+STATE_DIR="${ORB_UP_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/orb-up}"
+SESSION_FILE_NAME="${SESSION//\//_}"
+RUNNER_STATE_FILE="$STATE_DIR/$SESSION_FILE_NAME.state"
+RESTART_PENDING_FILE="$STATE_DIR/$SESSION_FILE_NAME.restart-pending"
+UPDATE_LOCK_DIR="$STATE_DIR/$SESSION_FILE_NAME.update-lock"
+UPDATE_LOCK_HELD=0
 
 usage() {
 	cat <<'EOF'
@@ -18,13 +23,14 @@ Commands:
   logs [lines]                     Show recent runner output (default: 200)
   attach                           Attach to the runner's tmux session
   update                           Update Amp and restart if it changed
-  enable-updates                   Install the daily update cron job
+  enable-updates                   Install the hourly update cron job
   disable-updates                  Remove the update cron job
 
 Environment:
   ORB_UP_SESSION       tmux session name (default: amp-runner)
   ORB_UP_RUNNER_ID     stable Amp runner ID (default: short hostname)
-  ORB_UP_UPDATE_CRON   five-field cron schedule (default: 17 4 * * *)
+  ORB_UP_UPDATE_CRON   five-field cron schedule (default: 17 * * * *)
+  ORB_UP_STATE_DIR     runtime state directory
   AMP_BIN              path to the Amp executable
 EOF
 }
@@ -64,13 +70,66 @@ pane_is_dead() {
 	[[ "$(tmux display-message -p -t "$SESSION" '#{pane_dead}')" == "1" ]]
 }
 
+release_update_lock() {
+	if [[ $UPDATE_LOCK_HELD -eq 1 ]]; then
+		rm -rf "$UPDATE_LOCK_DIR"
+		UPDATE_LOCK_HELD=0
+	fi
+}
+
+acquire_update_lock() {
+	if ! mkdir "$UPDATE_LOCK_DIR" 2>/dev/null; then
+		# Give a concurrent lock owner time to record its PID before checking for a stale lock.
+		sleep 0.1
+		local owner_pid=""
+		[[ ! -r "$UPDATE_LOCK_DIR/pid" ]] || read -r owner_pid < "$UPDATE_LOCK_DIR/pid" || true
+		if [[ "$owner_pid" =~ ^[1-9][0-9]*$ ]] && kill -0 "$owner_pid" 2>/dev/null; then
+			return 1
+		fi
+		rm -rf "$UPDATE_LOCK_DIR"
+		mkdir "$UPDATE_LOCK_DIR" 2>/dev/null || return 1
+	fi
+	printf '%s\n' "$$" > "$UPDATE_LOCK_DIR/pid"
+	UPDATE_LOCK_HELD=1
+}
+
+runner_activity() {
+	if ! has_session; then
+		printf 'stopped\n'
+		return
+	fi
+	if pane_is_dead; then
+		printf 'exited\n'
+		return
+	fi
+	if [[ ! -r "$RUNNER_STATE_FILE" ]]; then
+		printf 'unknown\n'
+		return
+	fi
+
+	local state plugin_pid
+	read -r state plugin_pid < "$RUNNER_STATE_FILE" || true
+	if [[ ! "$plugin_pid" =~ ^[1-9][0-9]*$ ]] || ! kill -0 "$plugin_pid" 2>/dev/null; then
+		printf 'unknown\n'
+		return
+	fi
+	case "$state" in
+		idle | busy) printf '%s\n' "$state" ;;
+		*) printf 'unknown\n' ;;
+	esac
+}
+
 restart_runner() {
 	if ! has_session; then
+		rm -f "$RESTART_PENDING_FILE"
 		printf 'Runner is not started; the update will be used next time it starts.\n'
 		return
 	fi
 
+	mkdir -p "$STATE_DIR"
+	tmux set-environment -t "$SESSION" ORB_UP_RUNNER_STATE_FILE "$RUNNER_STATE_FILE"
 	tmux respawn-pane -k -t "$SESSION"
+	rm -f "$RESTART_PENDING_FILE"
 	printf 'Restarted runner in tmux session %s.\n' "$SESSION"
 }
 
@@ -104,10 +163,14 @@ start_runner() {
 		amp_args=(--runner-id "${ORB_UP_RUNNER_ID:-$(hostname -s)}" "${amp_args[@]}")
 	fi
 
+	mkdir -p "$STATE_DIR"
+	rm -f "$RUNNER_STATE_FILE" "$RESTART_PENDING_FILE"
+
 	# Create the pane first so remain-on-exit is active even if Amp exits immediately.
 	tmux new-session -d -s "$SESSION" -c "$directory"
 	tmux set-option -t "$SESSION" remain-on-exit on >/dev/null
 	tmux set-environment -t "$SESSION" PATH "$PATH"
+	tmux set-environment -t "$SESSION" ORB_UP_RUNNER_STATE_FILE "$RUNNER_STATE_FILE"
 	[[ -z "${AMP_API_KEY:-}" ]] || tmux set-environment -t "$SESSION" AMP_API_KEY "$AMP_API_KEY"
 	[[ -z "${AMP_HOME:-}" ]] || tmux set-environment -t "$SESSION" AMP_HOME "$AMP_HOME"
 
@@ -125,6 +188,7 @@ stop_runner() {
 	need tmux
 	if has_session; then
 		tmux kill-session -t "$SESSION"
+		rm -f "$RUNNER_STATE_FILE" "$RESTART_PENDING_FILE"
 		printf 'Stopped runner.\n'
 	else
 		printf 'Runner is not started.\n'
@@ -143,8 +207,8 @@ show_status() {
 		return 1
 	fi
 
-	printf 'running (tmux session: %s, directory: %s)\n' \
-		"$SESSION" "$(tmux display-message -p -t "$SESSION" '#{pane_current_path}')"
+	printf 'running, %s (tmux session: %s, directory: %s)\n' \
+		"$(runner_activity)" "$SESSION" "$(tmux display-message -p -t "$SESSION" '#{pane_current_path}')"
 }
 
 show_logs() {
@@ -156,7 +220,24 @@ show_logs() {
 }
 
 update_amp() {
-	local amp_bin output
+	need tmux
+	mkdir -p "$STATE_DIR"
+	if ! acquire_update_lock; then
+		printf 'Another update check is already running; skipping.\n'
+		return
+	fi
+	trap release_update_lock EXIT
+
+	local activity amp_bin output
+	activity="$(runner_activity)"
+	if [[ "$activity" == "busy" || "$activity" == "unknown" ]]; then
+		if [[ -f "$RESTART_PENDING_FILE" ]]; then
+			printf 'Runner is %s; restart deferred until the next idle update check.\n' "$activity"
+		else
+			printf 'Runner is %s; update deferred until the next check.\n' "$activity"
+		fi
+		return
+	fi
 	amp_bin="$(find_amp)"
 	if ! output="$("$amp_bin" update --porcelain 2>&1)"; then
 		printf '%s\n' "$output" >&2
@@ -165,7 +246,15 @@ update_amp() {
 	printf '%s\n' "$output"
 
 	if printf '%s\n' "$output" | grep -q '^updated '; then
-		need tmux
+		touch "$RESTART_PENDING_FILE"
+	fi
+
+	if [[ -f "$RESTART_PENDING_FILE" ]]; then
+		activity="$(runner_activity)"
+		if [[ "$activity" == "busy" || "$activity" == "unknown" ]]; then
+			printf 'Runner became %s; restart deferred until the next idle update check.\n' "$activity"
+			return
+		fi
 		restart_runner
 	fi
 }
@@ -186,7 +275,7 @@ enable_updates() {
 	amp_bin="$(find_amp)"
 	executable="$(script_path)"
 	log_file="$STATE_DIR/update.log"
-	cron_line="$UPDATE_CRON AMP_BIN=$(shell_quote "$amp_bin") ORB_UP_SESSION=$(shell_quote "$SESSION") $(shell_quote "$executable") update >> $(shell_quote "$log_file") 2>&1 $CRON_MARKER"
+	cron_line="$UPDATE_CRON AMP_BIN=$(shell_quote "$amp_bin") ORB_UP_SESSION=$(shell_quote "$SESSION") ORB_UP_STATE_DIR=$(shell_quote "$STATE_DIR") $(shell_quote "$executable") update >> $(shell_quote "$log_file") 2>&1 $CRON_MARKER"
 	existing_crontab="$(crontab -l 2>/dev/null || true)"
 
 	{

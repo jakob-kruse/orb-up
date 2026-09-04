@@ -4,6 +4,7 @@ set -euo pipefail
 REPOSITORY="${ORB_UP_REPOSITORY:-jakob-kruse/orb-up}"
 REF="${ORB_UP_REF:-main}"
 SOURCE_URL="${ORB_UP_SOURCE_URL:-https://raw.githubusercontent.com/$REPOSITORY/$REF/orb-up}"
+PLUGIN_SOURCE_URL="${ORB_UP_PLUGIN_SOURCE_URL:-https://raw.githubusercontent.com/$REPOSITORY/$REF/orb-up-idle.ts}"
 
 die() {
 	printf 'orb-up installer: %s\n' "$*" >&2
@@ -54,14 +55,21 @@ fi
 
 install_directory="${ORB_UP_INSTALL_DIR:-$HOME/.local/bin}"
 mkdir -p "$install_directory"
+plugin_directory="${ORB_UP_PLUGIN_DIR:-$HOME/.config/amp/plugins}"
+mkdir -p "$plugin_directory"
 
 printf 'Installing orb-up...\n'
 download "$SOURCE_URL" "$temporary_directory/orb-up"
+download "$PLUGIN_SOURCE_URL" "$temporary_directory/orb-up-idle.ts"
 install -m 0755 "$temporary_directory/orb-up" "$install_directory/orb-up"
+install -m 0644 "$temporary_directory/orb-up-idle.ts" "$plugin_directory/orb-up-idle.ts"
 
 AMP_BIN="$amp_bin" "$install_directory/orb-up" enable-updates
 
 printf '\norb-up is installed at %s/orb-up.\n' "$install_directory"
+if tmux has-session -t "${ORB_UP_SESSION:-amp-runner}" 2>/dev/null; then
+	printf 'An existing runner must be restarted once while idle to enable idle tracking.\n'
+fi
 if [[ ":$PATH:" != *":$install_directory:"* ]]; then
 	printf 'Add it to this shell now with:\n  export PATH="%s:$PATH"\n' "$install_directory"
 fi

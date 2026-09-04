@@ -14,7 +14,8 @@ The installer:
 
 - installs Amp with its official installer if needed;
 - installs `orb-up` in `~/.local/bin`;
-- registers a daily Amp update at 04:17 with the user's crontab.
+- installs a tiny Amp lifecycle plugin used to detect whether the runner is idle;
+- registers an hourly update check at 17 minutes past the hour with the user's crontab.
 
 Log in first if needed (`amp login`), then start a runner in the directory where it should accept work:
 
@@ -42,7 +43,9 @@ orb-up enable-updates
 orb-up disable-updates
 ```
 
-`orb-up update` runs `amp update`. If Amp installs a new version and the runner is started, it restarts the runner so the new binary takes effect. That restart can interrupt an active thread.
+`orb-up update` only starts an update when the runner is idle. If a thread is running—or idle state cannot be verified—it defers until the next hourly check. It checks again before restarting and leaves the restart pending if work started during the update.
+
+When upgrading an existing `orb-up` installation, run `orb-up restart` once while its runner is idle so the runner loads the idle-tracking plugin.
 
 Use environment variables to change the tmux session, default runner ID, or cron schedule:
 

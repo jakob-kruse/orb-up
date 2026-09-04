@@ -1,0 +1,235 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SESSION="${ORB_UP_SESSION:-amp-runner}"
+UPDATE_CRON="${ORB_UP_UPDATE_CRON:-17 4 * * *}"
+CRON_MARKER="# orb-up automatic update"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/orb-up"
+
+usage() {
+	cat <<'EOF'
+Usage: orb-up <command>
+
+Commands:
+  start [directory] [amp options]  Start an Amp runner in tmux
+  stop                             Stop the runner
+  restart                          Restart the runner
+  status                           Show whether the runner is running
+  logs [lines]                     Show recent runner output (default: 200)
+  attach                           Attach to the runner's tmux session
+  update                           Update Amp and restart if it changed
+  enable-updates                   Install the daily update cron job
+  disable-updates                  Remove the update cron job
+
+Environment:
+  ORB_UP_SESSION       tmux session name (default: amp-runner)
+  ORB_UP_RUNNER_ID     stable Amp runner ID (default: short hostname)
+  ORB_UP_UPDATE_CRON   five-field cron schedule (default: 17 4 * * *)
+  AMP_BIN              path to the Amp executable
+EOF
+}
+
+die() {
+	printf 'orb-up: %s\n' "$*" >&2
+	exit 1
+}
+
+need() {
+	command -v "$1" >/dev/null 2>&1 || die "'$1' is required"
+}
+
+shell_quote() {
+	local value="$1"
+	value="${value//\'/\'\\\'\'}"
+	printf "'%s'" "$value"
+}
+
+find_amp() {
+	if [[ -n "${AMP_BIN:-}" && -x "$AMP_BIN" ]]; then
+		printf '%s\n' "$AMP_BIN"
+	elif command -v amp >/dev/null 2>&1; then
+		command -v amp
+	elif [[ -x "${AMP_HOME:-$HOME/.amp}/bin/amp" ]]; then
+		printf '%s/bin/amp\n' "${AMP_HOME:-$HOME/.amp}"
+	else
+		die "Amp is not installed; run https://ampcode.com/install.sh"
+	fi
+}
+
+has_session() {
+	tmux has-session -t "$SESSION" 2>/dev/null
+}
+
+pane_is_dead() {
+	[[ "$(tmux display-message -p -t "$SESSION" '#{pane_dead}')" == "1" ]]
+}
+
+restart_runner() {
+	if ! has_session; then
+		printf 'Runner is not started; the update will be used next time it starts.\n'
+		return
+	fi
+
+	tmux respawn-pane -k -t "$SESSION"
+	printf 'Restarted runner in tmux session %s.\n' "$SESSION"
+}
+
+start_runner() {
+	need tmux
+
+	if has_session; then
+		die "tmux session '$SESSION' already exists; use 'orb-up status' or 'orb-up restart'"
+	fi
+
+	local directory="$PWD"
+	if [[ $# -gt 0 && "$1" != -* ]]; then
+		directory="$1"
+		shift
+	fi
+	[[ -d "$directory" ]] || die "directory does not exist: $directory"
+	directory="$(cd "$directory" && pwd)"
+
+	local amp_bin
+	amp_bin="$(find_amp)"
+
+	local -a amp_args=("$@")
+	local has_runner_id=0
+	local arg
+	for arg in "${amp_args[@]}"; do
+		case "$arg" in
+			--runner-id | --runner-id=*) has_runner_id=1 ;;
+		esac
+	done
+	if [[ $has_runner_id -eq 0 ]]; then
+		amp_args=(--runner-id "${ORB_UP_RUNNER_ID:-$(hostname -s)}" "${amp_args[@]}")
+	fi
+
+	# Create the pane first so remain-on-exit is active even if Amp exits immediately.
+	tmux new-session -d -s "$SESSION" -c "$directory"
+	tmux set-option -t "$SESSION" remain-on-exit on >/dev/null
+	tmux set-environment -t "$SESSION" PATH "$PATH"
+	[[ -z "${AMP_API_KEY:-}" ]] || tmux set-environment -t "$SESSION" AMP_API_KEY "$AMP_API_KEY"
+	[[ -z "${AMP_HOME:-}" ]] || tmux set-environment -t "$SESSION" AMP_HOME "$AMP_HOME"
+
+	local runner_command=""
+	for arg in "$amp_bin" --no-tui "${amp_args[@]}"; do
+		runner_command+="$(shell_quote "$arg") "
+	done
+	tmux respawn-pane -k -t "$SESSION" -c "$directory" "$runner_command"
+
+	printf 'Started Amp runner in tmux session %s (directory: %s).\n' "$SESSION" "$directory"
+	printf 'Use "orb-up logs" or "orb-up attach" to inspect it.\n'
+}
+
+stop_runner() {
+	need tmux
+	if has_session; then
+		tmux kill-session -t "$SESSION"
+		printf 'Stopped runner.\n'
+	else
+		printf 'Runner is not started.\n'
+	fi
+}
+
+show_status() {
+	need tmux
+	if ! has_session; then
+		printf 'stopped\n'
+		return 1
+	fi
+
+	if pane_is_dead; then
+		printf 'exited (tmux session: %s)\n' "$SESSION"
+		return 1
+	fi
+
+	printf 'running (tmux session: %s, directory: %s)\n' \
+		"$SESSION" "$(tmux display-message -p -t "$SESSION" '#{pane_current_path}')"
+}
+
+show_logs() {
+	need tmux
+	has_session || die "runner is not started"
+	local lines="${1:-200}"
+	[[ "$lines" =~ ^[1-9][0-9]*$ ]] || die "line count must be a positive integer"
+	tmux capture-pane -p -t "$SESSION" -S "-$lines"
+}
+
+update_amp() {
+	local amp_bin output
+	amp_bin="$(find_amp)"
+	if ! output="$("$amp_bin" update --porcelain 2>&1)"; then
+		printf '%s\n' "$output" >&2
+		return 1
+	fi
+	printf '%s\n' "$output"
+
+	if printf '%s\n' "$output" | grep -q '^updated '; then
+		need tmux
+		restart_runner
+	fi
+}
+
+script_path() {
+	local path="${BASH_SOURCE[0]}"
+	if [[ "$path" != /* ]]; then
+		path="$(cd "$(dirname "$path")" && pwd)/$(basename "$path")"
+	fi
+	printf '%s\n' "$path"
+}
+
+enable_updates() {
+	need crontab
+	mkdir -p "$STATE_DIR"
+
+	local amp_bin executable log_file cron_line existing_crontab
+	amp_bin="$(find_amp)"
+	executable="$(script_path)"
+	log_file="$STATE_DIR/update.log"
+	cron_line="$UPDATE_CRON AMP_BIN=$(shell_quote "$amp_bin") ORB_UP_SESSION=$(shell_quote "$SESSION") $(shell_quote "$executable") update >> $(shell_quote "$log_file") 2>&1 $CRON_MARKER"
+	existing_crontab="$(crontab -l 2>/dev/null || true)"
+
+	{
+		[[ -z "$existing_crontab" ]] || printf '%s\n' "$existing_crontab" | grep -vF "$CRON_MARKER" || true
+		printf '%s\n' "$cron_line"
+	} | crontab -
+
+	printf 'Installed automatic update job: %s\n' "$UPDATE_CRON"
+	printf 'Update log: %s\n' "$log_file"
+}
+
+disable_updates() {
+	need crontab
+	local existing_crontab
+	existing_crontab="$(crontab -l 2>/dev/null || true)"
+	{
+		[[ -z "$existing_crontab" ]] || printf '%s\n' "$existing_crontab" | grep -vF "$CRON_MARKER" || true
+	} | crontab -
+	printf 'Removed automatic update job.\n'
+}
+
+command="${1:-}"
+[[ $# -eq 0 ]] || shift
+
+case "$command" in
+	start) start_runner "$@" ;;
+	stop) stop_runner ;;
+	restart)
+		need tmux
+		has_session || die "runner is not started"
+		restart_runner
+		;;
+	status) show_status ;;
+	logs) show_logs "$@" ;;
+	attach)
+		need tmux
+		has_session || die "runner is not started"
+		exec tmux attach-session -t "$SESSION"
+		;;
+	update) update_amp ;;
+	enable-updates) enable_updates ;;
+	disable-updates) disable_updates ;;
+	-h | --help | help) usage ;;
+	'') usage; exit 1 ;;
+	*) die "unknown command: $command (run 'orb-up --help')" ;;
+esac

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPOSITORY="${ORB_UP_REPOSITORY:-jakob-kruse/orb-up}"
+REPOSITORY="${ORB_UP_REPOSITORY:-J4K4-Dev/orb-up}"
 REF="${ORB_UP_REF:-main}"
 SOURCE_URL="${ORB_UP_SOURCE_URL:-https://raw.githubusercontent.com/$REPOSITORY/$REF/orb-up}"
 PLUGIN_SOURCE_URL="${ORB_UP_PLUGIN_SOURCE_URL:-https://raw.githubusercontent.com/$REPOSITORY/$REF/orb-up-idle.ts}"

@@ -7,7 +7,7 @@ A tiny wrapper that keeps an [Amp](https://ampcode.com) runner alive in tmux and
 The machine needs Bash, tmux, and cron. Then run:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/jakob-kruse/orb-up/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/J4K4-Dev/orb-up/main/install.sh | bash
 ```
 
 The installer:

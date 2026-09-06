@@ -42,6 +42,7 @@ need install
 need mktemp
 command -v tmux >/dev/null 2>&1 || die "'tmux' is required (install the tmux package)"
 command -v crontab >/dev/null 2>&1 || die "'crontab' is required (install the cron or cronie package)"
+command -v pgrep >/dev/null 2>&1 || die "'pgrep' is required (install the procps package)"
 
 temporary_directory="$(mktemp -d)"
 trap 'rm -rf "$temporary_directory"' EXIT

@@ -70,6 +70,24 @@ pane_is_dead() {
 	[[ "$(tmux display-message -p -t "$SESSION" '#{pane_dead}')" == "1" ]]
 }
 
+amp_runner_command() {
+	local pid="$1"
+	local process_name command_line
+	IFS= read -r process_name < <(ps -p "$pid" -o comm= 2>/dev/null) || return 1
+	[[ "${process_name##*/}" == "amp" ]] || return 1
+	IFS= read -r command_line < <(ps -p "$pid" -o command= 2>/dev/null) || return 1
+	case "$command_line" in
+		*" --no-tui" | *" --no-tui "*) printf '%s\n' "$command_line" ;;
+		*) return 1 ;;
+	esac
+}
+
+process_is_running() {
+	local state
+	IFS= read -r state < <(ps -p "$1" -o stat= 2>/dev/null) || return 1
+	[[ -n "$state" && "$state" != Z* ]]
+}
+
 release_update_lock() {
 	if [[ $UPDATE_LOCK_HELD -eq 1 ]]; then
 		rm -rf "$UPDATE_LOCK_DIR"
@@ -135,10 +153,47 @@ restart_runner() {
 
 start_runner() {
 	need tmux
+	need pgrep
 
 	if has_session; then
 		die "tmux session '$SESSION' already exists; use 'orb-up status' or 'orb-up restart'"
 	fi
+
+	local pid command_line reply attempts
+	for pid in $(pgrep -U "$(id -u)" -x amp 2>/dev/null || true); do
+		command_line="$(amp_runner_command "$pid" || true)"
+		[[ -n "$command_line" ]] || continue
+
+		local ancestor_pid="$PPID"
+		while [[ "$ancestor_pid" =~ ^[1-9][0-9]*$ && "$ancestor_pid" -gt 1 ]]; do
+			if [[ "$ancestor_pid" == "$pid" ]]; then
+				die "cannot replace Amp runner PID $pid from a command running inside it; use a separate terminal"
+			fi
+			ancestor_pid="$(ps -p "$ancestor_pid" -o ppid= 2>/dev/null | tr -d ' ' || true)"
+		done
+
+		printf 'Found an unmanaged Amp runner (PID %s):\n  %s\n' "$pid" "$command_line" >&2
+		printf 'Stop it before starting this runner? Only continue if it is idle. [y/N] ' >&2
+		if ! IFS= read -r reply; then
+			die "confirmation required; existing runner was not stopped"
+		fi
+		case "$reply" in
+			y | Y | yes | YES | Yes) ;;
+			*) die "existing runner was not stopped" ;;
+		esac
+
+		# Recheck the process before signaling in case the PID was reused while waiting for input.
+		command_line="$(amp_runner_command "$pid" || true)"
+		[[ -n "$command_line" ]] || continue
+		kill "$pid"
+		attempts=0
+		while process_is_running "$pid" && [[ $attempts -lt 50 ]]; do
+			sleep 0.1
+			((attempts += 1))
+		done
+		process_is_running "$pid" && die "Amp runner PID $pid did not stop after 5 seconds"
+		printf 'Stopped unmanaged Amp runner PID %s.\n' "$pid"
+	done
 
 	local directory="$PWD"
 	if [[ $# -gt 0 && "$1" != -* ]]; then
@@ -151,16 +206,15 @@ start_runner() {
 	local amp_bin
 	amp_bin="$(find_amp)"
 
-	local -a amp_args=("$@")
 	local has_runner_id=0
 	local arg
-	for arg in "${amp_args[@]}"; do
+	for arg in "$@"; do
 		case "$arg" in
 			--runner-id | --runner-id=*) has_runner_id=1 ;;
 		esac
 	done
 	if [[ $has_runner_id -eq 0 ]]; then
-		amp_args=(--runner-id "${ORB_UP_RUNNER_ID:-$(hostname -s)}" "${amp_args[@]}")
+		set -- --runner-id "${ORB_UP_RUNNER_ID:-$(hostname -s)}" "$@"
 	fi
 
 	mkdir -p "$STATE_DIR"
@@ -175,7 +229,7 @@ start_runner() {
 	[[ -z "${AMP_HOME:-}" ]] || tmux set-environment -t "$SESSION" AMP_HOME "$AMP_HOME"
 
 	local runner_command=""
-	for arg in "$amp_bin" --no-tui "${amp_args[@]}"; do
+	for arg in "$amp_bin" --no-tui "$@"; do
 		runner_command+="$(shell_quote "$arg") "
 	done
 	tmux respawn-pane -k -t "$SESSION" -c "$directory" "$runner_command"

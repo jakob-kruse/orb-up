@@ -4,7 +4,7 @@ A small Bash wrapper for running an [Amp](https://ampcode.com) runner in tmux, w
 
 ## Install
 
-You'll need Bash, tmux, cron, and curl on the machine that will host the runner. Install `orb-up` with:
+You'll need Bash, tmux, cron, `pgrep`, and curl on the machine that will host the runner. Install `orb-up` with:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/J4K4-Dev/orb-up/main/install.sh | bash
@@ -24,6 +24,8 @@ Make sure `~/.local/bin` is on your `PATH`. Log in with `amp login` if you haven
 ```bash
 orb-up start /path/to/project
 ```
+
+If `orb-up` finds an existing `amp --no-tui` process outside its tmux session, it shows the process and asks before stopping it. Confirm only after checking that the existing runner is idle. A declined or unavailable confirmation leaves the process untouched and cancels the start.
 
 By default, the runner uses the machine's short hostname as its stable runner ID. You can pass Amp options after the directory to choose a different ID or enable remote terminal access:
 

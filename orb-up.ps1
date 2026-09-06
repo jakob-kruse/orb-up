@@ -145,7 +145,7 @@ function Start-Runner([string[]]$Arguments) {
 	}
 	$directory = (Resolve-Path -LiteralPath $directory).Path
 
-	$hasRunnerId = $Arguments | Where-Object { $_ -eq '--runner-id' -or $_.StartsWith('--runner-id=') }
+	$hasRunnerId = $Arguments | Where-Object { $_ -and ($_ -eq '--runner-id' -or $_.StartsWith('--runner-id=')) }
 	if (-not $hasRunnerId) {
 		$runnerId = if ($env:ORB_UP_RUNNER_ID) { $env:ORB_UP_RUNNER_ID } else { $env:COMPUTERNAME }
 		$Arguments = @('--runner-id', $runnerId) + $Arguments
